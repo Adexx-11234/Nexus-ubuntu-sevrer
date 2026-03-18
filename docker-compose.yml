@@ -1,0 +1,66 @@
+version: "3.9"
+
+# ============================================================
+#  docker-compose.yml
+#  Ubuntu 22.04 Server with QEMU/KVM + Tailscale + sshx
+# ============================================================
+
+services:
+  ubuntu-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: ubuntu-nexus-server
+
+    # Load secrets from .env file
+    env_file:
+      - .env
+
+    # ── Networking ──────────────────────────────────────────
+    ports:
+      - "2222:22"        # SSH:  ssh root@<host-ip> -p 2222
+      - "16509:16509"    # libvirt remote management (optional)
+
+    # ── KVM / nested virtualisation ─────────────────────────
+    # Pass /dev/kvm from the host into the container.
+    # If your host has KVM enabled, this enables hardware acceleration.
+    devices:
+      - /dev/kvm:/dev/kvm
+      - /dev/net/tun:/dev/net/tun    # needed for Tailscale userspace networking
+
+    # Privileged mode lets us:
+    #  • load KVM kernel modules (modprobe)
+    #  • configure iptables (Tailscale)
+    #  • manage libvirt / QEMU
+    privileged: true
+
+    # ── Capabilities (alternative to full privileged, kept for clarity) ──
+    cap_add:
+      - NET_ADMIN        # Tailscale needs this
+      - SYS_MODULE       # modprobe kvm_intel / kvm_amd
+      - SYS_ADMIN        # libvirt / mount operations
+
+    # ── Security options ────────────────────────────────────
+    security_opt:
+      - seccomp:unconfined   # required for KVM ioctls inside containers
+
+    # ── Persistent storage ──────────────────────────────────
+    volumes:
+      - tailscale-state:/var/lib/tailscale   # persist Tailscale identity
+      - kvm-images:/var/lib/libvirt/images   # persist VM disk images
+
+    # ── Keep alive ──────────────────────────────────────────
+    restart: unless-stopped
+
+    # ── Health check ────────────────────────────────────────
+    healthcheck:
+      test: ["CMD", "service", "ssh", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  tailscale-state:
+  kvm-images:
