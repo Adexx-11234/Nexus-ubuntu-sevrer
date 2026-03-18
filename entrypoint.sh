@@ -32,34 +32,106 @@ ssh-keygen -A 2>/dev/null || true
 
 service ssh start && log "OpenSSH started." || warn "SSH may already be running."
 
-# ─── 2. Force QEMU / KVM setup ───────────────────────────────
-head "QEMU / KVM"
+# ─── 2. Force QEMU / KVM setup (aggressive multi-method) ─────
+head "QEMU / KVM — Forced Setup"
 
-# Try loading KVM modules (may fail in unprivileged containers – handled gracefully)
-if [ -w /dev/kvm ] 2>/dev/null || [ -e /dev/kvm ]; then
-    log "/dev/kvm already available."
-else
-    warn "/dev/kvm not found – attempting to load kernel modules…"
-    modprobe kvm          2>/dev/null && log "kvm module loaded."       || warn "Could not load kvm (needs --device /dev/kvm on host)."
-    modprobe kvm_intel nested=1 2>/dev/null && log "kvm_intel loaded."  || true
-    modprobe kvm_amd   nested=1 2>/dev/null && log "kvm_amd loaded."    || true
+kvm_active=false
+
+# ── Method 1: Already present ─────────────────────────────────
+if [ -e /dev/kvm ] && [ -r /dev/kvm ]; then
+    log "Method 1: /dev/kvm already present and readable."
+    kvm_active=true
 fi
 
-# Verify KVM status
-if [ -e /dev/kvm ]; then
-    log "KVM is ACTIVE (/dev/kvm present)."
-    # Check nested virtualisation
+# ── Method 2: Load kernel modules then check again ─────────────
+if [ "$kvm_active" = false ]; then
+    warn "Method 2: /dev/kvm missing – loading kernel modules…"
+    modprobe kvm          2>/dev/null && log "  ✓ kvm base module loaded"       || warn "  ✗ kvm base module failed"
+    modprobe kvm_intel nested=1 2>/dev/null && log "  ✓ kvm_intel (nested=1) loaded" || warn "  ✗ kvm_intel not available (may be AMD host)"
+    modprobe kvm_amd   nested=1 2>/dev/null && log "  ✓ kvm_amd (nested=1) loaded"   || warn "  ✗ kvm_amd not available (may be Intel host)"
+    # Also try loading vhost modules for better networking performance
+    modprobe vhost      2>/dev/null || true
+    modprobe vhost_net  2>/dev/null || true
+    sleep 1
+    if [ -e /dev/kvm ]; then
+        log "  /dev/kvm appeared after loading modules!"
+        kvm_active=true
+    fi
+fi
+
+# ── Method 3: mknod using /proc/misc dynamic minor number ──────
+# /proc/misc lists the actual minor number the kernel registered for kvm
+if [ "$kvm_active" = false ]; then
+    warn "Method 3: Creating /dev/kvm node via mknod + /proc/misc…"
+    KVM_MINOR=$(grep -w 'kvm' /proc/misc 2>/dev/null | awk '{print $1}')
+    if [ -n "$KVM_MINOR" ]; then
+        log "  Found KVM in /proc/misc with minor number: ${KVM_MINOR}"
+        mknod /dev/kvm c 10 "${KVM_MINOR}" 2>/dev/null && \
+            chmod 666 /dev/kvm && \
+            log "  ✓ /dev/kvm created via mknod (minor=${KVM_MINOR})" || \
+            warn "  ✗ mknod failed (need --privileged)"
+        if [ -e /dev/kvm ]; then
+            # Quick test: dd from /dev/kvm to confirm it actually works
+            if dd if=/dev/kvm count=0 2>/dev/null; then
+                log "  ✓ /dev/kvm is readable and functional!"
+                kvm_active=true
+            else
+                warn "  ✗ /dev/kvm exists but is not accessible (kernel module not loaded on host)"
+                rm -f /dev/kvm
+            fi
+        fi
+    else
+        warn "  kvm not found in /proc/misc — host kernel has no KVM module loaded at all."
+    fi
+fi
+
+# ── Method 4: mknod with hardcoded fallback minor (232) ────────
+if [ "$kvm_active" = false ]; then
+    warn "Method 4: Trying mknod with hardcoded minor 232 (common default)…"
+    mknod /dev/kvm c 10 232 2>/dev/null && chmod 666 /dev/kvm || true
+    if [ -e /dev/kvm ]; then
+        if dd if=/dev/kvm count=0 2>/dev/null; then
+            log "  ✓ /dev/kvm functional with minor=232!"
+            kvm_active=true
+        else
+            warn "  ✗ /dev/kvm node created but not functional – removing stub."
+            rm -f /dev/kvm
+        fi
+    fi
+fi
+
+# ── Final KVM status report ────────────────────────────────────
+echo ""
+if [ "$kvm_active" = true ]; then
+    chmod 666 /dev/kvm 2>/dev/null || true
     NESTED_INTEL=$(cat /sys/module/kvm_intel/parameters/nested 2>/dev/null || echo "N/A")
     NESTED_AMD=$(cat /sys/module/kvm_amd/parameters/nested   2>/dev/null || echo "N/A")
-    log "Nested virt (Intel): ${NESTED_INTEL} | (AMD): ${NESTED_AMD}"
+    echo -e "  ${GRN}╔══════════════════════════════════════════════╗${NC}"
+    echo -e "  ${GRN}║  ✅ KVM IS ACTIVE — Hardware acceleration ON ║${NC}"
+    echo -e "  ${GRN}║  Nested virt Intel: ${NESTED_INTEL}  AMD: ${NESTED_AMD}          ║${NC}"
+    echo -e "  ${GRN}╚══════════════════════════════════════════════╝${NC}"
 else
-    warn "KVM not available. QEMU will run in TCG (software emulation) mode."
-    warn "To enable KVM, run the container with:  --device /dev/kvm --privileged"
+    echo -e "  ${YEL}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "  ${YEL}║  ⚠  KVM NOT AVAILABLE — Using QEMU TCG (software mode) ║${NC}"
+    echo -e "  ${YEL}║                                                          ║${NC}"
+    echo -e "  ${YEL}║  To get real KVM, your HOST machine must:                ║${NC}"
+    echo -e "  ${YEL}║   1. Have an Intel/AMD CPU with VT-x / AMD-V             ║${NC}"
+    echo -e "  ${YEL}║   2. Have KVM enabled in BIOS/UEFI                       ║${NC}"
+    echo -e "  ${YEL}║   3. Run: modprobe kvm_intel nested=1  (on the HOST)     ║${NC}"
+    echo -e "  ${YEL}║   4. Pass --device /dev/kvm to this container            ║${NC}"
+    echo -e "  ${YEL}║                                                          ║${NC}"
+    echo -e "  ${YEL}║  QEMU still works — just slower for nested VMs.          ║${NC}"
+    echo -e "  ${YEL}╚══════════════════════════════════════════════════════════╝${NC}"
 fi
+echo ""
+
+# Enable ignore_msrs for better KVM guest compat
+echo 1 > /sys/module/kvm/parameters/ignore_msrs 2>/dev/null || true
 
 # Start libvirtd daemon
 if command -v libvirtd &>/dev/null; then
     libvirtd --daemon 2>/dev/null && log "libvirtd started." || warn "libvirtd already running or unavailable."
+    sleep 1
 fi
 
 # ─── 3. Tailscale ────────────────────────────────────────────
