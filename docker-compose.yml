@@ -13,47 +13,43 @@ services:
 
     container_name: ubuntu-nexus-server
 
-    # Load secrets from .env file
     env_file:
       - .env
 
-    # ── Networking ──────────────────────────────────────────
     ports:
-      - "2222:22"        # SSH:  ssh root@<host-ip> -p 2222
-      - "16509:16509"    # libvirt remote management (optional)
+      - "2222:22"
+      - "16509:16509"
 
-    # ── KVM / nested virtualisation ─────────────────────────
-    # Pass /dev/kvm from the host into the container.
-    # If your host has KVM enabled, this enables hardware acceleration.
-    devices:
-      - /dev/kvm:/dev/kvm
-      - /dev/net/tun:/dev/net/tun    # needed for Tailscale userspace networking
+    # ── KVM — most portable approach ────────────────────────
+    # device_cgroup_rules grants permission to mknod /dev/kvm inside
+    # the container even when the host doesn't pass /dev/kvm through.
+    # The entrypoint script tries 4 methods to create /dev/kvm.
+    device_cgroup_rules:
+      - 'c 10:* rwm'   # misc devices: /dev/kvm is major=10, minor=232
+      - 'c 5:* rwm'    # /dev/net/tun (Tailscale)
 
-    # Privileged mode lets us:
-    #  • load KVM kernel modules (modprobe)
-    #  • configure iptables (Tailscale)
-    #  • manage libvirt / QEMU
+    # Uncomment if /dev/kvm already exists on your host for best performance:
+    # devices:
+    #   - /dev/kvm:/dev/kvm
+    #   - /dev/net/tun:/dev/net/tun
+
     privileged: true
 
-    # ── Capabilities (alternative to full privileged, kept for clarity) ──
     cap_add:
-      - NET_ADMIN        # Tailscale needs this
-      - SYS_MODULE       # modprobe kvm_intel / kvm_amd
-      - SYS_ADMIN        # libvirt / mount operations
+      - NET_ADMIN
+      - SYS_MODULE
+      - SYS_ADMIN
+      - MKNOD
 
-    # ── Security options ────────────────────────────────────
     security_opt:
-      - seccomp:unconfined   # required for KVM ioctls inside containers
+      - seccomp:unconfined
 
-    # ── Persistent storage ──────────────────────────────────
     volumes:
-      - tailscale-state:/var/lib/tailscale   # persist Tailscale identity
-      - kvm-images:/var/lib/libvirt/images   # persist VM disk images
+      - tailscale-state:/var/lib/tailscale
+      - kvm-images:/var/lib/libvirt/images
 
-    # ── Keep alive ──────────────────────────────────────────
     restart: unless-stopped
 
-    # ── Health check ────────────────────────────────────────
     healthcheck:
       test: ["CMD", "service", "ssh", "status"]
       interval: 30s
